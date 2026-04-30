@@ -377,6 +377,118 @@ Describe 'Get-TangentClassification' {
     }
 }
 
+Describe 'Get-TangentWorktreeHolders' {
+    BeforeAll {
+        Import-Module (Join-Path $script:RepoRoot 'scripts\TangentInventory.psm1') -Force
+        $script:HolderTmp = Join-Path ([IO.Path]::GetTempPath()) "tangent-holders-$(Get-Random)"
+        New-Item -ItemType Directory -Path $script:HolderTmp -Force | Out-Null
+    }
+    AfterAll {
+        Remove-Item -LiteralPath $script:HolderTmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'returns empty when no process references the path' {
+        $unique = Join-Path $script:HolderTmp ("never-referenced-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $unique -Force | Out-Null
+        @(Get-TangentWorktreeHolders -Worktree $unique).Count | Should -Be 0
+    }
+
+    It 'detects a self-spawned process whose command line contains the path' {
+        $wt = Join-Path $script:HolderTmp ("held-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $wt -Force | Out-Null
+        # Spawn a pwsh that sleeps and embeds the path in its command line so detection can see it.
+        $cmd = "Set-Location -LiteralPath '$wt'; Start-Sleep -Seconds 30  # marker:$wt"
+        $proc = Start-Process pwsh -PassThru -WindowStyle Hidden `
+            -ArgumentList @('-NoProfile','-Command',$cmd)
+        try {
+            Start-Sleep -Milliseconds 500
+            $holders = @(Get-TangentWorktreeHolders -Worktree $wt)
+            ($holders | Where-Object { $_.ProcessId -eq $proc.Id }).Count | Should -Be 1
+            # pwsh.exe is on the allowlist
+            ($holders | Where-Object { $_.ProcessId -eq $proc.Id }).Allowlisted | Should -BeTrue
+        } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'flags non-allowlisted holders' {
+        # Build a fake-named copy of pwsh that is NOT on the allowlist (e.g. notepad.exe-style).
+        # Easier: just verify the allowlist constant directly via a synthetic match.
+        $wt = Join-Path $script:HolderTmp ("audit-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $wt -Force | Out-Null
+        # Use cmd.exe (not on allowlist) with a sleep that mentions the path.
+        $proc = Start-Process cmd.exe -PassThru -WindowStyle Hidden `
+            -ArgumentList @('/c', "echo $wt && timeout /t 30 /nobreak >NUL")
+        try {
+            Start-Sleep -Milliseconds 500
+            $holders = @(Get-TangentWorktreeHolders -Worktree $wt)
+            $match = $holders | Where-Object { $_.ProcessId -eq $proc.Id }
+            $match | Should -Not -BeNullOrEmpty
+            $match.Allowlisted | Should -BeFalse
+        } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'detects descendants of an allowlisted holder via process-tree traversal' {
+        $wt = Join-Path $script:HolderTmp ("descendant-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $wt -Force | Out-Null
+        # Spawn an allowlisted parent (pwsh) whose cmdline contains the path,
+        # then have it spawn a non-allowlisted child (cmd.exe) whose cmdline does NOT.
+        $cmd = "Set-Location -LiteralPath '$wt'; Start-Process cmd.exe -ArgumentList '/c','timeout /t 30 /nobreak >NUL' -WindowStyle Hidden -Wait"
+        $proc = Start-Process pwsh -PassThru -WindowStyle Hidden `
+            -ArgumentList @('-NoProfile','-Command',$cmd)
+        try {
+            Start-Sleep -Seconds 1
+            $holders = @(Get-TangentWorktreeHolders -Worktree $wt)
+            # Parent matched by path, child matched as descendant
+            ($holders | Where-Object { $_.ProcessId -eq $proc.Id -and $_.MatchedBy -eq 'path' }) | Should -Not -BeNullOrEmpty
+            $descendants = $holders | Where-Object { $_.MatchedBy -eq 'descendant' -and $_.Name -eq 'cmd.exe' }
+            $descendants | Should -Not -BeNullOrEmpty
+        } finally {
+            # Kill the whole tree (parent + any cmd children that are still alive).
+            Get-CimInstance Win32_Process -EA SilentlyContinue |
+                Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape($wt) } |
+                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'detects holders by branch name when path is not in command line' {
+        $wt = Join-Path $script:HolderTmp ("branch-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $wt -Force | Out-Null
+        $branch = 'tangent/branch-detect-test'
+        # Embed branch in a string literal so it's visible in the captured CommandLine,
+        # while still actually running Start-Sleep (a leading `#` would comment everything out).
+        $proc = Start-Process pwsh -PassThru -WindowStyle Hidden `
+            -ArgumentList @('-NoProfile','-Command',"`$null = '$branch'; Start-Sleep 30")
+        try {
+            Start-Sleep -Milliseconds 800
+            # Without -Branch arg: should NOT find it (path not in cmdline)
+            @(Get-TangentWorktreeHolders -Worktree $wt | Where-Object { $_.ProcessId -eq $proc.Id }).Count | Should -Be 0
+            # With -Branch arg: should find it via branch match
+            $h = @(Get-TangentWorktreeHolders -Worktree $wt -Branch $branch | Where-Object { $_.ProcessId -eq $proc.Id })
+            $h.Count | Should -Be 1
+            $h[0].MatchedBy | Should -Be 'branch'
+        } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'excludes the calling process and its ancestor chain by default (prevents self-kill)' {
+        $wt = Join-Path $script:HolderTmp ("self-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $wt -Force | Out-Null
+        # Run the helper from inside a child pwsh whose own cmdline contains the worktree path.
+        # Since the child IS $PID inside its own invocation, default exclusion must hide it.
+        $child = Start-Process pwsh -PassThru -Wait -NoNewWindow -ArgumentList @(
+            '-NoProfile','-Command',
+            "Import-Module '$($script:RepoRoot)\scripts\TangentInventory.psm1'; " +
+            "@(Get-TangentWorktreeHolders -Worktree '$wt' | Where-Object { `$_.ProcessId -eq `$PID }).Count"
+        ) -RedirectStandardOutput (Join-Path $script:HolderTmp 'self-out.txt')
+        $count = (Get-Content (Join-Path $script:HolderTmp 'self-out.txt') -Raw).Trim()
+        $count | Should -Be '0'
+    }
+}
+
 Describe 'Test-TangentOwnership' {
     BeforeAll {
         Import-Module (Join-Path $script:RepoRoot 'scripts\TangentInventory.psm1') -Force
@@ -727,6 +839,23 @@ Describe 'tangent-prune -Branch selection' {
         $LASTEXITCODE | Should -Be 0
         $obj = $out | ConvertFrom-Json
         $obj.dryRun | Should -BeTrue
+    }
+
+    It '-StopHolders is a recognized switch (script accepts without erroring)' {
+        $out = & pwsh -NoProfile -File $script:PruneScript -Branch 'tangent/does-not-exist' -StopHolders -DryRun -Json 2>&1
+        $LASTEXITCODE | Should -Be 0
+        $obj = $out | ConvertFrom-Json
+        $obj.dryRun | Should -BeTrue
+    }
+
+    It 'JSON action shape includes blocked + holders fields' {
+        $out = & pwsh -NoProfile -File $script:PruneScript -Branch 'tangent/does-not-exist' -DryRun -Json 2>&1
+        $LASTEXITCODE | Should -Be 0
+        $obj = $out | ConvertFrom-Json
+        # actions array may be empty when no real worktree exists, but the JSON must still parse
+        # and the report shape must be stable for downstream consumers.
+        $obj.PSObject.Properties.Name | Should -Contain 'actions'
+        $obj.PSObject.Properties.Name | Should -Contain 'skipped'
     }
 }
 

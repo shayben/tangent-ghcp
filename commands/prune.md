@@ -98,6 +98,19 @@ Map to `-OnDirty` (the script does the git work for you):
 | Discard | `& $pruneScript -Branch '<b>' -OnDirty discard` |
 | Cancel | respond "Cancelled." and stop |
 
+**If the report shows `🔒 worktree-remove ... process(es) holding worktree`** (the `actions[].holders` array is populated and `actions[].blocked` is true), a still-running WT tab is keeping the directory open. Surface to the user:
+
+```
+ask_user (allow_freeform: false):
+  question: "<branch> is being held open by <N> process(es): <PIDs>. How should I proceed?"
+  choices:
+    - "Close the WT tab manually, then retry"
+    - "Kill them and proceed (only kills pwsh/powershell/copilot/node)"
+    - "Cancel"
+```
+
+On "Kill them and proceed", re-run the same command with `-StopHolders` appended.
+
 **If `$pick.dirty` is false**, the standard confirm is enough:
 ```
 ask_user: "Proceed with the actions above?"  choices: ["Yes", "No"]

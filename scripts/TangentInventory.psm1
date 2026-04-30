@@ -90,6 +90,102 @@ function Test-TangentOwnership {
     return $true
 }
 
+function Get-TangentWorktreeHolders {
+    <#
+    Best-effort discovery of processes running inside a tangent worktree
+    (the WT tab's pwsh + copilot.exe + its node helpers). Detection signals,
+    in order of reliability:
+      1. CommandLine contains the worktree path.
+      2. CommandLine contains the branch name (e.g. `-n tangent/foo` for copilot.exe).
+      3. ParentProcessId chain leads back to a holder from (1) or (2) — catches
+         copilot.exe / node.exe children of the WT-tab pwsh whose own command
+         lines mention neither path nor branch.
+    -ExcludePid (defaults to the current process + its parent chain) prevents
+    the prune script from finding itself / its launcher in the result set,
+    which would cause a self-kill hang under -StopHolders.
+    Returns @() if none, else @(@{ProcessId; Name; CommandLine; Allowlisted; MatchedBy}).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Worktree,
+        [string]$Branch = '',
+        [int[]]$ExcludePid
+    )
+
+    $allowlist = @('pwsh.exe','powershell.exe','copilot.exe','node.exe')
+
+    $resolved = try { (Resolve-Path -LiteralPath $Worktree -ErrorAction Stop).Path } catch { $Worktree }
+    $variants = @($resolved, $Worktree, ($resolved -replace '\\','/')) | Sort-Object -Unique
+    $alts = ($variants | ForEach-Object { [regex]::Escape($_) }) -join '|'
+    $pathPattern = "(?:$alts)(?=$|[\s""'\\/])"
+
+    try { $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
+    catch { return @() }
+
+    $byPid = @{}
+    foreach ($p in $procs) { $byPid[[int]$p.ProcessId] = $p }
+
+    # Default exclusion: $PID (the caller — typically the prune script itself,
+    # whose own command line will contain the branch name) plus its ancestor
+    # chain up to the session host. Without this the script self-matches and
+    # Stop-Process kills itself mid-run.
+    if (-not $PSBoundParameters.ContainsKey('ExcludePid')) {
+        $ExcludePid = @()
+        $cur = $PID
+        $guard = 0
+        while ($cur -and $byPid.ContainsKey($cur) -and $guard -lt 32) {
+            $ExcludePid += $cur
+            $cur = [int]$byPid[$cur].ParentProcessId
+            $guard++
+        }
+    }
+    $excludeSet = @{}
+    foreach ($x in $ExcludePid) { $excludeSet[[int]$x] = $true }
+
+    $matched = @{}
+    foreach ($p in $procs) {
+        $pid_ = [int]$p.ProcessId
+        if ($excludeSet.ContainsKey($pid_)) { continue }
+        if (-not $p.CommandLine) { continue }
+        if ($p.CommandLine -match $pathPattern) {
+            $matched[$pid_] = 'path'
+            continue
+        }
+        if ($Branch -and ($p.CommandLine -match [regex]::Escape($Branch) + '(?=$|[\s"''\\/])')) {
+            $matched[$pid_] = 'branch'
+        }
+    }
+
+    $changed = $true
+    while ($changed) {
+        $changed = $false
+        foreach ($p in $procs) {
+            $pid_ = [int]$p.ProcessId
+            if ($matched.ContainsKey($pid_)) { continue }
+            if ($excludeSet.ContainsKey($pid_)) { continue }
+            $ppid = [int]$p.ParentProcessId
+            if ($matched.ContainsKey($ppid) -and $byPid.ContainsKey($ppid)) {
+                $parent = $byPid[$ppid]
+                if ($allowlist -contains $parent.Name.ToLowerInvariant()) {
+                    $matched[$pid_] = 'descendant'
+                    $changed = $true
+                }
+            }
+        }
+    }
+
+    foreach ($pid_ in $matched.Keys) {
+        $p = $byPid[$pid_]
+        [pscustomobject]@{
+            ProcessId    = $pid_
+            Name         = [string]$p.Name
+            CommandLine  = [string]$p.CommandLine
+            Allowlisted  = ($allowlist -contains $p.Name.ToLowerInvariant())
+            MatchedBy    = $matched[$pid_]
+        }
+    }
+}
+
 function Get-TangentClassification {
     [CmdletBinding()]
     param(
@@ -296,4 +392,5 @@ Export-ModuleMember -Function `
     Get-TangentStateRecords, `
     Get-TangentClassification, `
     Test-TangentOwnership, `
+    Get-TangentWorktreeHolders, `
     Get-TangentNudge

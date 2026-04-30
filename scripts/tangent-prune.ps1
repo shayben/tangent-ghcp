@@ -53,6 +53,15 @@
       * discard — alias for -Force
     Only meaningful with -Branch (single name).
 
+.PARAMETER StopHolders
+    When the script detects that the worktree is being held open by a still-running
+    process (typically the WT tab's `pwsh.exe` + `copilot.exe`), the default behavior
+    is to refuse the worktree-remove and surface the holder PIDs. With -StopHolders,
+    the script kills allowlisted holders (`pwsh.exe`, `powershell.exe`, `copilot.exe`,
+    `node.exe`) and proceeds. Non-allowlisted holders (e.g. WindowsTerminal.exe,
+    editors) are NEVER auto-killed — the script refuses and asks the user to close
+    them manually.
+
 .PARAMETER CommitMessage
     Required when -OnDirty commit. Passed to `git commit -m`.
 #>
@@ -68,6 +77,7 @@ param(
     [switch]$Fetch,
     [switch]$Force,
     [switch]$Menu,
+    [switch]$StopHolders,
     [ValidateSet('fail', 'stash', 'commit', 'discard')]
     [string]$OnDirty = 'fail',
     [string]$CommitMessage = ''
@@ -201,13 +211,22 @@ foreach ($it in $inv) {
 $report = [System.Collections.Generic.List[object]]::new()
 
 function Add-Report {
-    param([string]$Branch, [string]$Action, [bool]$Success, [string]$Detail)
+    param(
+        [string]$Branch,
+        [string]$Action,
+        [bool]$Success,
+        [string]$Detail,
+        [object[]]$Holders = @(),
+        [bool]$Blocked = $false
+    )
     $report.Add([pscustomobject]@{
         branch  = $Branch
         action  = $Action
         success = $Success
         detail  = $Detail
         dryRun  = [bool]$DryRun
+        holders = @($Holders)
+        blocked = $Blocked
     })
 }
 
@@ -258,7 +277,85 @@ foreach ($it in $selected) {
         }
     }
 
-    # 1. Remove worktree (`git worktree remove` refuses on dirty / locked unless --force)
+    # 1. Holder pre-flight: detect WT tabs / shells still inside the worktree.
+    #    Pass branch so copilot.exe's `-n <branch>` argument is also a detection signal.
+    $holdersFull     = @(Get-TangentWorktreeHolders -Worktree $worktree -Branch $br)
+    $holdersRedacted = @($holdersFull | ForEach-Object {
+        [pscustomobject]@{
+            ProcessId   = $_.ProcessId
+            Name        = $_.Name
+            allowlisted = [bool]$_.Allowlisted
+            matchedBy   = [string]$_.MatchedBy
+        }
+    })
+    # Only DIRECT matches (path / branch in command line) need to be allowlisted by name.
+    # Descendants reached via traversal already passed through an allowlisted parent
+    # (Get-TangentWorktreeHolders only walks through allowlisted parents), so they're
+    # provably part of the tangent process tree and safe to kill regardless of their
+    # own name (e.g. cmd.exe spawned by copilot.exe to run a tool).
+    $nonAllowed = @($holdersFull | Where-Object {
+        ($_.MatchedBy -in @('path','branch')) -and (-not $_.Allowlisted)
+    })
+
+    if ($holdersFull.Count -gt 0) {
+        $pidSummary = ($holdersFull | ForEach-Object { "$($_.ProcessId) $($_.Name)" }) -join ', '
+
+        if ($DryRun) {
+            $blockMsg = "would refuse: $($holdersFull.Count) process(es) holding worktree ($pidSummary). " +
+                        "Pass -StopHolders to kill allowlisted holders, or close the WT tab(s) for $br first."
+            Add-Report -Branch $br -Action 'worktree-remove' -Success $false -Detail $blockMsg `
+                       -Holders $holdersRedacted -Blocked $true
+            continue
+        }
+
+        if (-not $StopHolders) {
+            $blockMsg = "$($holdersFull.Count) process(es) holding worktree ($pidSummary). " +
+                        "Close the WT tab(s) for $br or re-run with -StopHolders to kill them."
+            Add-Report -Branch $br -Action 'worktree-remove' -Success $false -Detail $blockMsg `
+                       -Holders $holdersRedacted -Blocked $true
+            continue
+        }
+
+        if ($nonAllowed.Count -gt 0) {
+            $nonAllowedSummary = ($nonAllowed | ForEach-Object { "$($_.ProcessId) $($_.Name)" }) -join ', '
+            $blockMsg = "refusing to kill non-allowlisted process(es): $nonAllowedSummary. " +
+                        '-StopHolders only kills pwsh/powershell/copilot/node. Close those manually first.'
+            Add-Report -Branch $br -Action 'worktree-remove' -Success $false -Detail $blockMsg `
+                       -Holders $holdersRedacted -Blocked $true
+            continue
+        }
+
+        # All holders are allowlisted — kill them.
+        # Order: descendants first (Get-TangentWorktreeHolders enumerates them after their
+        # parents, so reverse-iterate). SilentlyContinue because killing a parent often
+        # takes its children with it — "already gone" is success, not failure.
+        $killed = @()
+        foreach ($h in ($holdersFull | Sort-Object @{e='MatchedBy'; desc=$true}, ProcessId)) {
+            $alive = $null -ne (Get-Process -Id $h.ProcessId -ErrorAction SilentlyContinue)
+            if ($alive) {
+                Stop-Process -Id $h.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+            $killed += "$($h.ProcessId) $($h.Name)"
+        }
+        # Give the OS a moment to release file handles, then verify no allowlisted holders remain.
+        Start-Sleep -Seconds 2
+        $remaining = @(Get-TangentWorktreeHolders -Worktree $worktree -Branch $br)
+        if ($remaining.Count -gt 0) {
+            $remSummary = ($remaining | ForEach-Object { "$($_.ProcessId) $($_.Name)" }) -join ', '
+            $remRedacted = @($remaining | ForEach-Object {
+                [pscustomobject]@{ ProcessId = $_.ProcessId; Name = $_.Name; allowlisted = [bool]$_.Allowlisted }
+            })
+            Add-Report -Branch $br -Action 'stop-holders' -Success $false `
+                       -Detail "killed $($killed.Count) (was: $($killed -join ', ')); but $($remaining.Count) holder(s) remain: $remSummary" `
+                       -Holders $remRedacted -Blocked $true
+            continue
+        }
+        Add-Report -Branch $br -Action 'stop-holders' -Success $true `
+                   -Detail "killed $($killed.Count) holder(s): $($killed -join ', ')" `
+                   -Holders $holdersRedacted
+    }
+
+    # 2. Remove worktree (`git worktree remove` refuses on dirty / locked unless --force)
     $rmCmd = if ($Force) { 'git worktree remove --force' } else { 'git worktree remove' }
     if ($DryRun) {
         $detail = if ($Force -and $it.Dirty) {
@@ -273,16 +370,39 @@ foreach ($it in $selected) {
         } else {
             & git -C $repoRoot worktree remove $worktree 2>&1
         }
-        if ($LASTEXITCODE -eq 0) {
+        $gitOk = ($LASTEXITCODE -eq 0)
+
+        # Hard postcondition: even if `git worktree remove` reports success, a still-held
+        # directory may remain on disk. We MUST verify before deleting the branch — otherwise
+        # the user is left with no git registration, no branch, and a stale dir.
+        $dirGone = -not (Test-Path -LiteralPath $worktree)
+
+        if ($gitOk -and $dirGone) {
             $detail = if ($Force -and $it.Dirty) { "$worktree (forced; uncommitted changes discarded)" } else { $worktree }
             Add-Report -Branch $br -Action 'worktree-remove' -Success $true -Detail $detail
+        } elseif ($gitOk -and -not $dirGone) {
+            # Common cause: a holder we didn't detect (CWD-only, e.g. a shell that `cd`'d in).
+            $postHolders = @(Get-TangentWorktreeHolders -Worktree $worktree -Branch $br)
+            $hint = if ($postHolders.Count -gt 0) {
+                $s = ($postHolders | ForEach-Object { "$($_.ProcessId) $($_.Name)" }) -join ', '
+                " — still held by: $s"
+            } else {
+                ' — no command-line holders detected; check for shells with cwd inside the worktree'
+            }
+            $redacted = @($postHolders | ForEach-Object {
+                [pscustomobject]@{ ProcessId = $_.ProcessId; Name = $_.Name; allowlisted = [bool]$_.Allowlisted }
+            })
+            Add-Report -Branch $br -Action 'worktree-remove' -Success $false `
+                       -Detail "git unregistered the worktree but the directory still exists: $worktree$hint. Branch deletion SKIPPED to avoid an inconsistent state." `
+                       -Holders $redacted -Blocked $true
+            continue   # CRITICAL: skip branch deletion
         } else {
             Add-Report -Branch $br -Action 'worktree-remove' -Success $false -Detail "$out"
-            continue   # don't try to delete the branch if worktree removal failed
+            continue
         }
     }
 
-    # 2. Branch deletion:
+    # 3. Branch deletion:
     #    - merged bucket → safe `-d` (refuses unmerged) as a guardrail.
     #    - -Force (user explicitly chose discard) → `-D` so re-spawning the
     #      same name doesn't auto-suffix to <branch>-2 next time.
@@ -311,7 +431,7 @@ foreach ($it in $selected) {
         }
     }
 
-    # 3. Clean up state.json record
+    # 4. Clean up state.json record
     if (-not $DryRun) {
         try {
             $state = Get-TangentStateRecords -StateFile $stateFile
@@ -357,7 +477,7 @@ if ($selected.Count -eq 0) {
     Write-Host '  Nothing to do.'
 }
 foreach ($r in $report) {
-    $glyph = if ($r.success) { '✓' } else { '✗' }
+    $glyph = if ($r.success) { '✓' } elseif ($r.blocked) { '🔒' } else { '✗' }
     Write-Host ("  {0} {1,-16} {2,-40} {3}" -f $glyph, $r.action, $r.branch, $r.detail)
 }
 
