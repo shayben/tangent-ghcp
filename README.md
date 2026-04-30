@@ -65,7 +65,7 @@ Three flavors, one per **context-handoff mode**:
 | `/tangent:summary <prompt>` | Agent-written summary of this chat | **Most common.** Hand off a side task with just enough context to be productive. |
 | `/tangent:new <prompt>` | None — blank session | When the side task is unrelated and you want a clean slate. |
 | `/tangent:full <prompt>` | Entire transcript via `/share` | When you literally want to fork the whole conversation. ⚠ Can blow the spawned session's context window on long chats. |
-| `/tangent:prune` | n/a — destructive (with guardrails) | Inventory + cleanup. Defaults to an interactive menu of worktrees; supports `--merged`/`--pushed`/`--orphaned`/`--all` fast paths and `--branch=<name>` for targeted drops. |
+| `/tangent:prune` | n/a — destructive (with guardrails) | Inventory + cleanup. Defaults to an interactive menu of worktrees; supports `--merged` / `--pushed` / `--orphaned` / `--all` fast paths and `--branch=<name>` for targeted drops. Refuses to clobber a worktree whose Windows Terminal tab is still alive — pass `-StopHolders` to auto-kill the in-tab `pwsh` / `copilot` / `node` processes (see *Pruning a live tangent* below). |
 
 Inside any Copilot CLI session, in any git repo:
 
@@ -132,6 +132,53 @@ stashed and re-applied inside the new worktree, so the side task
 literally builds on top of your unfinished work.
 
 Skip the menu with `--ignore-dirty`.
+
+## Pruning a live tangent
+
+If the tangent's Windows Terminal tab is still open when you
+`/tangent:prune` it, `git worktree remove` will refuse the FS deletion
+because `pwsh.exe` / `copilot.exe` in that tab are holding the directory
+open. Without intervention, you'd end up with a half-cleaned state: git
+unregisters the worktree, the directory lingers on disk, and the tab
+goes inert.
+
+`tangent-prune.ps1` defends against this with two layers:
+
+1. **Holder pre-flight.** Before calling `git worktree remove`, the
+   script scans for processes whose command line references the
+   worktree path or the branch name (e.g. `copilot.exe -n tangent/foo`),
+   plus their bounded descendants reached through allowlisted parents
+   (so `cmd.exe` / `node.exe` spawned by `copilot.exe` are caught too).
+   If any are found, it refuses with the PIDs and a hint.
+
+2. **Hard postcondition.** Even if `git worktree remove --force`
+   reports success, the script verifies the directory is actually gone
+   before deleting the branch. If a holder we missed kept the dir on
+   disk, branch deletion is **skipped** — never produces an
+   inconsistent state.
+
+To proceed, either:
+
+- **Close the WT tab manually**, then re-run the prune, or
+- **Pass `-StopHolders`**, which kills allowlisted holders
+  (`pwsh.exe`, `powershell.exe`, `copilot.exe`, `node.exe`) plus their
+  descendants in the tangent process tree, then proceeds:
+
+  ```powershell
+  & $pruneScript -Branch tangent/<name> -Force -StopHolders
+  ```
+
+  Non-allowlisted *direct* matches (e.g. `WindowsTerminal.exe` itself,
+  unrelated editors that happened to reference the path) are never
+  auto-killed — `-StopHolders` will refuse and ask you to close them
+  manually.
+
+The interactive `/tangent:prune` menu surfaces the same prompt on a
+holders-blocked outcome and offers to retry with `-StopHolders` for
+you. CWD-only holders (e.g. an unrelated shell that `cd`'d into the
+worktree) are not detected by the pre-flight scan, but the
+postcondition catches the symptom and the failure message tells you
+where to look.
 
 ## Launcher resolution
 
