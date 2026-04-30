@@ -1,0 +1,28 @@
+{
+  "_comment": "Hooks fire on lifecycle events of the Copilot CLI session that loaded this plugin. Stop is gated on $env:TANGENT_SESSION (set only inside spawned tangent tabs by the generated launch.ps1). UserPromptSubmit fires in the parent session before each user prompt and surfaces any pending tangent handback files (best-effort: silently no-ops if the CLI version doesn't support this hook type, and if the parent session has no inbox dir).",
+  "Stop": [
+    {
+      "type": "command",
+      "command": "pwsh",
+      "args": [
+        "-NoProfile",
+        "-Command",
+        "if (-not $env:TANGENT_SESSION) { return }; [Console]::Beep(880, 150); [Console]::Beep(660, 150); if (Get-Module -ListAvailable BurntToast) { Import-Module BurntToast; New-BurntToastNotification -Text 'tangent', \"Session ended on $env:TANGENT_BRANCH\" }; try { $invMod = Get-ChildItem \"$env:USERPROFILE\\.copilot\\installed-plugins\" -Recurse -Filter TangentInventory.psm1 -EA SilentlyContinue | Select-Object -First 1; if ($invMod) { Import-Module $invMod.FullName -Force; $inv = Get-TangentInventory; $me = $inv | Where-Object { $_.Branch -eq $env:TANGENT_BRANCH }; if ($me -and $me.Status -eq 'merged') { Write-Host \"`n💡 This tangent ($($env:TANGENT_BRANCH)) is merged into the default branch. Run /tangent:prune from the parent session to clean up.\" } } } catch {}"
+      ]
+    }
+  ],
+  "UserPromptSubmit": [
+    {
+      "type": "command",
+      "command": "pwsh",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "try { $s = Get-ChildItem \"$env:USERPROFILE\\.copilot\\installed-plugins\" -Recurse -Filter tangent-inbox-ingest.ps1 -EA SilentlyContinue | Select-Object -First 1; if ($s) { & $s.FullName } } catch { [Console]::Error.WriteLine(\"tangent-inbox-ingest dispatcher: $($_.Exception.Message)\") } finally { exit 0 }"
+      ]
+    }
+  ]
+}
+

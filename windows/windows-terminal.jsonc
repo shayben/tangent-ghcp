@@ -1,0 +1,43 @@
+// tangent — Windows Terminal companion config
+//
+// Merge the relevant pieces into your existing settings.json
+// (Settings → Open JSON file). This file is JSONC (comments allowed)
+// for documentation; settings.json is also JSONC.
+{
+  // ──────────────────────────────────────────────────────────────────
+  // Profiles — add a "Tangent host" pwsh profile with the bell visible.
+  // Locate "profiles": { "list": [ ... ] } in your settings.json and
+  // append this object to the list.
+  // ──────────────────────────────────────────────────────────────────
+  "profiles_example_entry": {
+    "name": "Tangent host",
+    "commandline": "pwsh.exe -NoLogo",
+    "icon": "🌿",
+    "bellStyle": ["audible", "window", "taskbar"],
+    "tabTitle": "tangent",
+    "startingDirectory": "%USERPROFILE%"
+  },
+
+  // ──────────────────────────────────────────────────────────────────
+  // Global bell settings — tab gets a visible bell indicator on Stop hook.
+  // Top-level keys you want set:
+  // ──────────────────────────────────────────────────────────────────
+  "bellStyle_topLevel": ["audible", "window", "taskbar"],
+
+  // ──────────────────────────────────────────────────────────────────
+  // Key binding — Ctrl+Shift+T launches tangent.ps1 with Read-Host
+  // prompts. Add this entry to "actions": [ ... ].
+  // Replace <PLUGIN_PATH> with the absolute path to where the plugin is
+  // installed (e.g. C:\Repos\tangent-ghcp). When installed via
+  // `copilot plugin install`, it lives under:
+  //   %USERPROFILE%\.copilot\plugin-cache\<owner>--<repo>\
+  // ──────────────────────────────────────────────────────────────────
+  "actions_example_entry": {
+    "command": {
+      "action": "newTab",
+      "profile": "Tangent host",
+      "commandline": "pwsh.exe -NoExit -NoLogo -Command \"$br = Read-Host 'tangent branch (blank = auto)'; $mode = Read-Host 'mode (new/summary/full, blank = summary)'; $prompt = Read-Host 'prompt'; & '<PLUGIN_PATH>\\scripts\\tangent.ps1' -Branch ($br ? $br : 'tangent/quick') -Mode ($mode ? $mode : 'summary') -Prompt $prompt\""
+    },
+    "keys": "ctrl+shift+t"
+  }
+}

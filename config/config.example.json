@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy this file to ~/.copilot/tangent/config.json and edit. All fields are optional.",
+
+  "_copilotCommand": "Override how tangent launches Copilot CLI. Either a string ('agency.exe copilot') or an array (['agency.exe','copilot']). Highest priority after explicit --launcher arg and $env:TANGENT_COPILOT_CMD.",
+  "copilotCommand": null,
+
+  "_worktreeRoot": "Where new tangent worktrees live. Defaults to $env:LOCALAPPDATA\\tangent\\worktrees. Overridden by $env:WORKTREE_ROOT.",
+  "worktreeRoot": null,
+
+  "_autodetectLauncher": "If true, walk parent processes via WMI to find agency.exe (or $env:TANGENT_LAUNCHER_HINT). Default: true. Set to false to skip autodetection.",
+  "autodetectLauncher": true,
+
+  "_launcherHint": "Optional process name (without path) to look for in parent process chain. Default: agency.exe.",
+  "launcherHint": "agency.exe"
+}

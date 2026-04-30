@@ -1,0 +1,15 @@
+{
+  "name": "tangent",
+  "description": "Spawn isolated GitHub Copilot CLI sessions for side tasks via git worktrees and Windows Terminal tabs. Adds /tangent:new (blank), /tangent:summary (summarized handoff), and /tangent:full (full-transcript handoff) slash commands.",
+  "version": "0.1.0",
+  "author": {
+    "name": "shayben",
+    "url": "https://github.com/shayben"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/shayben/tangent-ghcp",
+  "repository": "https://github.com/shayben/tangent-ghcp",
+  "keywords": ["worktree", "windows-terminal", "side-task", "tangent", "copilot", "ghcp"],
+  "commands": "commands/",
+  "hooks": "hooks/hooks.json"
+}
